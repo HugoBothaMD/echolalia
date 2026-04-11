@@ -1,0 +1,79 @@
+# Example SSL Pretraining Configuration
+# Usage: python -m clinical_speech_ssl.train --config configs/ssl_pretraining.yaml
+
+# Model Configuration
+model:
+  input_type: "waveform"  # "waveform" or "spectrogram"
+  frontend_type: "cnn_base"  # "cnn_small", "cnn_base", "cnn_large", "patch_tall_narrow", "patch_vit"
+  encoder_type: "conformer_medium"  # "transformer_small", "transformer_base", "conformer_small", "conformer_medium", "conformer_large"
+  embed_dim: 256
+  
+  # SSL Objectives
+  use_augmentation_prediction: true
+  use_masked_reconstruction: true
+  use_contrastive: true
+  
+  # Augmentation Prediction Settings
+  num_augmentation_types: 4
+  augmentation_per_region: true
+  predict_magnitude: true
+  
+  # Masked Reconstruction Settings
+  mask_prob: 0.15
+  mask_span_length: 10
+  transition_bias: 2.0  # Higher = more masking at phoneme transitions
+  
+  # Contrastive Settings
+  contrastive_projection_dim: 256
+  contrastive_temperature: 0.07
+  
+  # Loss Weights
+  aug_loss_weight: 1.0
+  mask_loss_weight: 1.0
+  contrastive_loss_weight: 0.5  # Often weighted lower than primary objectives
+
+# Data Configuration
+data:
+  data_root: "/path/to/clinical_speech_data"
+  sample_rate: 16000
+  max_length_sec: 10.0
+  min_length_sec: 0.5
+  train_ratio: 0.8
+  val_ratio: 0.1
+
+# Training Configuration
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  max_epochs: 100
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  
+  checkpoint_dir: "./checkpoints/ssl_pretrain"
+  save_every_n_epochs: 5
+  keep_n_checkpoints: 3
+  
+  log_every_n_steps: 100
+  eval_every_n_epochs: 1
+  
+  early_stopping_patience: 15
+  early_stopping_metric: "val_total_loss"
+  early_stopping_mode: "min"
+  
+  use_amp: true
+  device: "cuda"
+  num_workers: 4
+  seed: 42
+
+# Spectrogram Settings (if using spectrogram input)
+spectrogram:
+  n_mels: 80
+  n_fft: 400
+  hop_length: 160
+  patch_frames: 4
+  patch_stride: 2
+  vit_patch_size: [16, 16]

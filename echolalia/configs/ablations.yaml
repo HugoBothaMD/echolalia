@@ -1,0 +1,171 @@
+# Experiment Ablation Configuration
+# For systematically testing different model configurations
+# Usage: python -m clinical_speech_ssl.run_experiments --config configs/ablations.yaml
+
+experiment_name: "clinical_speech_ssl_ablations"
+output_dir: "./experiments"
+num_seeds: 3  # Run each config with multiple seeds
+
+# Base configuration (shared across all experiments)
+base:
+  data:
+    data_root: "/path/to/clinical_speech_data"
+    sample_rate: 16000
+    max_length_sec: 10.0
+  
+  training:
+    max_epochs: 50
+    batch_size: 32
+    learning_rate: 1.0e-4
+    early_stopping_patience: 10
+    use_amp: true
+
+# Ablation studies
+ablations:
+  # Study 1: Input Modality
+  input_modality:
+    description: "Compare waveform vs spectrogram inputs"
+    sweep:
+      - name: "waveform_cnn"
+        model:
+          input_type: "waveform"
+          frontend_type: "cnn_base"
+      - name: "spec_tall_narrow"
+        model:
+          input_type: "spectrogram"
+          frontend_type: "patch_tall_narrow"
+      - name: "spec_vit"
+        model:
+          input_type: "spectrogram"
+          frontend_type: "patch_vit"
+
+  # Study 2: Encoder Architecture
+  encoder_architecture:
+    description: "Compare Transformer vs Conformer encoders"
+    sweep:
+      - name: "transformer_small"
+        model:
+          encoder_type: "transformer_small"
+          embed_dim: 256
+      - name: "transformer_base"
+        model:
+          encoder_type: "transformer_base"
+          embed_dim: 768
+      - name: "conformer_small"
+        model:
+          encoder_type: "conformer_small"
+          embed_dim: 256
+      - name: "conformer_medium"
+        model:
+          encoder_type: "conformer_medium"
+          embed_dim: 256
+
+  # Study 3: SSL Objectives
+  ssl_objectives:
+    description: "Ablate different SSL objective combinations"
+    sweep:
+      - name: "aug_only"
+        model:
+          use_augmentation_prediction: true
+          use_masked_reconstruction: false
+          use_contrastive: false
+      - name: "mask_only"
+        model:
+          use_augmentation_prediction: false
+          use_masked_reconstruction: true
+          use_contrastive: false
+      - name: "contrastive_only"
+        model:
+          use_augmentation_prediction: false
+          use_masked_reconstruction: false
+          use_contrastive: true
+      - name: "aug_plus_mask"
+        model:
+          use_augmentation_prediction: true
+          use_masked_reconstruction: true
+          use_contrastive: false
+      - name: "all_objectives"
+        model:
+          use_augmentation_prediction: true
+          use_masked_reconstruction: true
+          use_contrastive: true
+
+  # Study 4: Transition Bias
+  transition_bias:
+    description: "Effect of transition-focused learning"
+    sweep:
+      - name: "no_bias"
+        model:
+          transition_bias: 1.0
+      - name: "low_bias"
+        model:
+          transition_bias: 1.5
+      - name: "medium_bias"
+        model:
+          transition_bias: 2.0
+      - name: "high_bias"
+        model:
+          transition_bias: 3.0
+      - name: "very_high_bias"
+        model:
+          transition_bias: 5.0
+
+  # Study 5: Loss Weights
+  loss_weights:
+    description: "Different weighting of SSL objectives"
+    sweep:
+      - name: "equal_weights"
+        model:
+          aug_loss_weight: 1.0
+          mask_loss_weight: 1.0
+          contrastive_loss_weight: 1.0
+      - name: "aug_emphasis"
+        model:
+          aug_loss_weight: 2.0
+          mask_loss_weight: 1.0
+          contrastive_loss_weight: 0.5
+      - name: "mask_emphasis"
+        model:
+          aug_loss_weight: 1.0
+          mask_loss_weight: 2.0
+          contrastive_loss_weight: 0.5
+      - name: "contrastive_minimal"
+        model:
+          aug_loss_weight: 1.0
+          mask_loss_weight: 1.0
+          contrastive_loss_weight: 0.1
+
+# Downstream evaluation protocol
+downstream_eval:
+  tasks:
+    - name: "dysarthria_detection"
+      type: "binary"
+      num_classes: 2
+    - name: "motor_speech_diagnosis"
+      type: "multiclass"
+      num_classes: 5
+    - name: "intelligibility_prediction"
+      type: "regression"
+      num_outputs: 1
+  
+  protocols:
+    - name: "linear_probe"
+      freeze_encoder: true
+      epochs: 50
+    - name: "fine_tune"
+      freeze_encoder: false
+      epochs: 30
+
+# Metrics to report
+metrics:
+  ssl:
+    - "total_loss"
+    - "aug_total_loss"
+    - "mask_loss"
+    - "contrastive_loss"
+  downstream:
+    - "accuracy"
+    - "f1_macro"
+    - "auroc"
+    - "mae"  # For regression
+    - "correlation"  # For regression

@@ -1,0 +1,80 @@
+# Example Downstream Fine-tuning Configuration
+# Usage: python -m clinical_speech_ssl.finetune --config configs/downstream_classification.yaml
+
+# Pretrained Model
+pretrained:
+  checkpoint_path: "./checkpoints/ssl_pretrain/best_model.pt"
+  freeze_encoder: false  # Set true for linear probing
+  freeze_encoder_layers: null  # Optionally freeze first N layers
+
+# Task Configuration
+task:
+  type: "classification"  # "classification", "regression", "multi_task"
+  
+  # For classification
+  num_classes: 5
+  task_type: "multiclass"  # "binary", "multiclass", "multilabel"
+  class_weights: null  # Optional: [1.0, 2.0, 1.5, 1.0, 3.0] for imbalanced data
+  
+  # For regression
+  # num_outputs: 1
+  # output_range: [0, 100]
+  
+  # For multi_task, define tasks list
+  # tasks:
+  #   - name: "has_dysarthria"
+  #     type: "binary"
+  #     num_outputs: 1
+  #     loss_weight: 1.0
+  #   - name: "severity"
+  #     type: "regression"
+  #     num_outputs: 1
+  #     loss_weight: 0.5
+  #     output_range: [0, 100]
+
+# Head Configuration
+head:
+  hidden_dims: [128]
+  dropout: 0.1
+  pooling: "attention"  # "mean", "attention", "first", "last"
+
+# Data Configuration
+data:
+  data_root: "/path/to/clinical_speech_data"
+  sample_rate: 16000
+  max_length_sec: 10.0
+  train_ratio: 0.7
+  val_ratio: 0.15
+  # test_ratio is implicit: 1 - train_ratio - val_ratio
+
+# Training Configuration
+training:
+  # Lower learning rate for fine-tuning
+  learning_rate: 1.0e-5
+  encoder_lr_ratio: 0.1  # Encoder LR = learning_rate * encoder_lr_ratio
+  weight_decay: 0.01
+  max_epochs: 50
+  warmup_epochs: 2
+  min_lr: 1.0e-7
+  
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  
+  checkpoint_dir: "./checkpoints/downstream_classification"
+  save_every_n_epochs: 5
+  keep_n_checkpoints: 3
+  
+  early_stopping_patience: 10
+  early_stopping_metric: "val_accuracy"  # or "val_loss", "val_mae", etc.
+  early_stopping_mode: "max"  # "max" for accuracy, "min" for loss
+  
+  use_amp: true
+  device: "cuda"
+  num_workers: 4
+  seed: 42
+
+# Evaluation
+evaluation:
+  metrics: ["accuracy", "f1_macro", "f1_weighted", "confusion_matrix"]
+  save_predictions: true
