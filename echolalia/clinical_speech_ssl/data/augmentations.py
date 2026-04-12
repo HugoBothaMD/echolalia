@@ -37,20 +37,25 @@ class AugmentationType(Enum):
     HIGH_PASS = "high_pass"
 
 
-CLINICAL_AUGMENTATIONS = {
+CLINICAL_AUGMENTATIONS = (
     AugmentationType.TIME_STRETCH,
     AugmentationType.PITCH_SHIFT,
     AugmentationType.FORMANT_SHIFT,
     AugmentationType.AMPLITUDE_MOD,
+)
+
+CLINICAL_AUGMENTATION_INDEX = {
+    aug: i for i, aug in enumerate(CLINICAL_AUGMENTATIONS)
 }
 
-SAFE_AUGMENTATIONS = {
+SAFE_AUGMENTATIONS = (
     AugmentationType.ADDITIVE_NOISE,
-    AugmentationType.REVERB,
+    # REVERB omitted — not implemented; including it would produce identity
+    # views in contrastive learning. TODO: implement with sampled RIRs.
     AugmentationType.GAIN,
     AugmentationType.LOW_PASS,
     AugmentationType.HIGH_PASS,
-}
+)
 
 
 @dataclass
@@ -86,10 +91,21 @@ class AugmentationConfig:
 
 
 @dataclass
+class RegionAugmentationLabel:
+    """Label for a single augmentation applied to a single region."""
+    start_sample: int
+    end_sample: int
+    aug_type: AugmentationType
+    param_normalized: float
+    is_transition: bool
+
+
+@dataclass
 class AugmentationResult:
     """Result of applying augmentations."""
     waveform: torch.Tensor
-    labels: Dict[str, float]  # Augmentation type -> magnitude applied
+    labels: Dict[str, float]  # Aggregated augmentation type -> max abs magnitude (back-compat)
+    region_labels: List[RegionAugmentationLabel] = field(default_factory=list)
     regions: Optional[List[Tuple[int, int]]] = None  # Which regions were augmented
 
 
@@ -620,10 +636,11 @@ class RegionAugmentor(nn.Module):
         """
         waveform_length = waveform.shape[-1]
         regions = self.sample_regions(waveform_length, gamma, num_regions)
-        
+
         result = waveform.clone()
         labels = {aug.value: 0.0 for aug in self.aug_types}
-        
+        region_labels = []
+
         for start, end, is_trans in regions:
             # Sample augmentation types for this region
             selected_augs = np.random.choice(
@@ -631,15 +648,24 @@ class RegionAugmentor(nn.Module):
                 size=min(num_augs_per_region, len(self.aug_types)),
                 replace=False,
             )
-            
+
             for aug_type in selected_augs:
                 result, param = self.apply_to_region(result, start, end, aug_type)
-                # Store the parameter (if multiple regions, this averages them)
-                labels[aug_type.value] = param
-        
+                region_labels.append(RegionAugmentationLabel(
+                    start_sample=start,
+                    end_sample=end,
+                    aug_type=aug_type,
+                    param_normalized=param,
+                    is_transition=is_trans,
+                ))
+                # Aggregated view: keep max absolute magnitude per type
+                if abs(param) > abs(labels[aug_type.value]):
+                    labels[aug_type.value] = param
+
         return AugmentationResult(
             waveform=result,
             labels=labels,
+            region_labels=region_labels,
             regions=[(s, e) for s, e, _ in regions],
         )
 
@@ -696,6 +722,5 @@ class SafeAugmentor(nn.Module):
                 result, _ = self.augmentor.apply_low_pass(result)
             elif aug_type == AugmentationType.HIGH_PASS:
                 result, _ = self.augmentor.apply_high_pass(result)
-            # Note: reverb would need additional implementation
         
         return result
