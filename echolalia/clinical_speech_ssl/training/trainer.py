@@ -197,12 +197,22 @@ class SSLTrainer:
             waveforms = batch["waveforms"].to(self.device)
             lengths = batch["lengths"].to(self.device)
             gammas = [g.to(self.device) for g in batch["gammas"]]
-            
+
+            # Optional GOP targets
+            gop_targets = None
+            if "gop_targets" in batch:
+                gop_targets = [
+                    g.to(self.device) if g is not None else None
+                    for g in batch["gop_targets"]
+                ]
+
             # Forward pass
             with torch.amp.autocast(device_type='cuda', enabled=self.config.use_amp):
-                losses = self.model(waveforms, gammas, lengths)
+                losses = self.model(
+                    waveforms, gammas, lengths, gop_targets=gop_targets,
+                )
                 loss = losses["total_loss"] / self.config.gradient_accumulation_steps
-            
+
             # Backward pass
             if self.scaler:
                 self.scaler.scale(loss).backward()
@@ -263,9 +273,18 @@ class SSLTrainer:
             waveforms = batch["waveforms"].to(self.device)
             lengths = batch["lengths"].to(self.device)
             gammas = [g.to(self.device) for g in batch["gammas"]]
-            
+
+            gop_targets = None
+            if "gop_targets" in batch:
+                gop_targets = [
+                    g.to(self.device) if g is not None else None
+                    for g in batch["gop_targets"]
+                ]
+
             with torch.amp.autocast(device_type='cuda', enabled=self.config.use_amp):
-                losses = self.model(waveforms, gammas, lengths)
+                losses = self.model(
+                    waveforms, gammas, lengths, gop_targets=gop_targets,
+                )
             
             metric_tracker.update(
                 {k: v.item() for k, v in losses.items()},
