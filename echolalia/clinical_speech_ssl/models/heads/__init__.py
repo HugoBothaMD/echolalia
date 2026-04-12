@@ -17,6 +17,10 @@ from clinical_speech_ssl.models.heads.contrastive_head import (
     SimCLRLoss,
     ContrastiveModule,
 )
+from clinical_speech_ssl.models.heads.gop_head import (
+    GOPPredictionHead,
+    GOPPredictionLoss,
+)
 
 __all__ = [
     "AugmentationPredictionHead",
@@ -30,4 +34,6 @@ __all__ = [
     "ContrastiveLoss",
     "SimCLRLoss",
     "ContrastiveModule",
+    "GOPPredictionHead",
+    "GOPPredictionLoss",
 ]

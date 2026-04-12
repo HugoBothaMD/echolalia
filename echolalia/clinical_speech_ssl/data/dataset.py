@@ -25,9 +25,13 @@ class SpeechSample:
     patient_id: Optional[str] = None
     session_id: Optional[str] = None
     utterance_id: Optional[str] = None
-    
+
     # Optional downstream labels
     clinical_labels: Optional[Dict[str, Union[int, float]]] = None
+
+    # Phase 2: SoftAlign integration targets
+    gop_targets: Optional[torch.Tensor] = None  # [num_phonemes] per-phoneme GOP scores
+    measure_targets: Optional[torch.Tensor] = None  # [D] utterance-level measure vector
 
 
 class ClinicalSpeechDataset(Dataset):
@@ -62,6 +66,9 @@ class ClinicalSpeechDataset(Dataset):
         load_clinical_labels: bool = True,
         transform: Optional[Callable] = None,
         gamma_mismatch_policy: str = "truncate",
+        min_quality_tier: Optional[int] = None,
+        load_gop_targets: bool = False,
+        load_measure_targets: bool = False,
     ):
         """
         Args:
@@ -74,9 +81,16 @@ class ClinicalSpeechDataset(Dataset):
             transform: Optional transform to apply to samples
             gamma_mismatch_policy: How to handle gamma/waveform length mismatches.
                 "raise" — error, "truncate" — fix silently, "warn" — fix with warning.
+            min_quality_tier: Minimum quality tier (3=HIGH, 2=MEDIUM, 1=LOW, 0=FAILED).
+                Samples below this threshold are dropped at load time.
+            load_gop_targets: If True, load GOP score files from manifest "gop_path" fields.
+            load_measure_targets: If True, load measure vectors from "measure_path" fields.
         """
         self.sample_rate = sample_rate
         self.gamma_mismatch_policy = gamma_mismatch_policy
+        self.min_quality_tier = min_quality_tier
+        self.load_gop_targets = load_gop_targets
+        self.load_measure_targets = load_measure_targets
         self.max_length = int(max_length_sec * sample_rate)
         self.min_length = int(min_length_sec * sample_rate)
         self.load_clinical_labels = load_clinical_labels
@@ -96,16 +110,30 @@ class ClinicalSpeechDataset(Dataset):
         """Load dataset from a manifest JSON file."""
         with open(manifest_path) as f:
             manifest = json.load(f)
-        
+
         self.metadata = manifest.get("metadata", {})
-        self.samples = manifest.get("samples", [])
-        
-        # Validate required fields
-        for sample in self.samples:
+        raw_samples = manifest.get("samples", [])
+
+        # Validate required fields and apply quality filter
+        filtered_count = 0
+        self.samples = []
+        for sample in raw_samples:
             if "audio_path" not in sample:
                 raise ValueError("Each sample must have 'audio_path'")
             if "gamma_path" not in sample:
                 raise ValueError("Each sample must have 'gamma_path'")
+
+            # Quality filtering
+            if self.min_quality_tier is not None:
+                tier = sample.get("quality_tier")
+                if tier is not None and tier < self.min_quality_tier:
+                    filtered_count += 1
+                    continue
+
+            self.samples.append(sample)
+
+        if filtered_count > 0:
+            print(f"Filtered {filtered_count} samples below quality tier {self.min_quality_tier}")
     
     def _load_from_directory(self, data_root: Path):
         """Load dataset from directory structure."""
@@ -246,6 +274,20 @@ class ClinicalSpeechDataset(Dataset):
             gamma, waveform, sample_id=sample_info.get("audio_path", str(idx)),
         )
         
+        # Load optional GOP targets
+        gop_targets = None
+        if self.load_gop_targets and "gop_path" in sample_info:
+            gop_targets = torch.load(
+                sample_info["gop_path"], weights_only=True,
+            ).float()
+
+        # Load optional measure targets
+        measure_targets = None
+        if self.load_measure_targets and "measure_path" in sample_info:
+            measure_targets = torch.from_numpy(
+                np.load(sample_info["measure_path"])
+            ).float()
+
         sample = SpeechSample(
             waveform=waveform,
             sample_rate=self.sample_rate,
@@ -255,11 +297,13 @@ class ClinicalSpeechDataset(Dataset):
             session_id=sample_info.get("session_id"),
             utterance_id=sample_info.get("utterance_id"),
             clinical_labels=sample_info.get("clinical_labels"),
+            gop_targets=gop_targets,
+            measure_targets=measure_targets,
         )
-        
+
         if self.transform is not None:
             sample = self.transform(sample)
-        
+
         return sample
     
     def get_clinical_label_info(self) -> Dict[str, Dict]:
@@ -355,7 +399,17 @@ class SSLCollator:
             "gammas": gammas,
             "patient_ids": [s.patient_id for s in batch],
         }
-        
+
+        # GOP targets: variable length per sample, keep as list
+        if batch[0].gop_targets is not None:
+            result["gop_targets"] = [s.gop_targets for s in batch]
+
+        # Measure targets: fixed length, stack into [B, D]
+        if batch[0].measure_targets is not None:
+            result["measure_targets"] = torch.stack(
+                [s.measure_targets for s in batch]
+            )
+
         # Collate clinical labels if present
         if batch[0].clinical_labels is not None:
             clinical_labels = {}

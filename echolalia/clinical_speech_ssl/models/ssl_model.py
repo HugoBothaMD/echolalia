@@ -30,6 +30,10 @@ from clinical_speech_ssl.models.heads import (
     MaskedPredictionModule,
     ContrastiveModule,
 )
+from clinical_speech_ssl.models.heads.gop_head import (
+    GOPPredictionHead,
+    GOPPredictionLoss,
+)
 from clinical_speech_ssl.data.augmentations import (
     RegionAugmentor,
     SafeAugmentor,
@@ -62,6 +66,7 @@ class ClinicalSpeechSSLConfig:
     use_augmentation_prediction: bool = True
     use_masked_reconstruction: bool = True
     use_contrastive: bool = True
+    use_gop_prediction: bool = False
     
     # Augmentation prediction config
     num_augmentation_types: int = 4
@@ -81,6 +86,7 @@ class ClinicalSpeechSSLConfig:
     aug_loss_weight: float = 1.0
     mask_loss_weight: float = 1.0
     contrastive_loss_weight: float = 1.0
+    gop_loss_weight: float = 0.5
     
     # Spectrogram-specific config
     n_mels: int = 80
@@ -163,6 +169,15 @@ class ClinicalSpeechSSL(nn.Module):
                 temperature=config.contrastive_temperature,
             )
         
+        if config.use_gop_prediction:
+            self.gop_head = GOPPredictionHead(
+                embed_dim=config.embed_dim,
+            )
+            self.gop_loss = GOPPredictionLoss()
+        else:
+            self.gop_head = None
+            self.gop_loss = None
+
         # Augmentors
         self.region_augmentor = RegionAugmentor(
             sample_rate=config.sample_rate,
@@ -291,56 +306,66 @@ class ClinicalSpeechSSL(nn.Module):
         waveform: torch.Tensor,
         gammas: Optional[List[torch.Tensor]] = None,
         lengths: Optional[torch.Tensor] = None,
+        gop_targets: Optional[List[torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass computing all SSL losses.
-        
+
         Args:
             waveform: Input audio [B, T]
             gammas: List of CTC gamma matrices (one per sample)
             lengths: Audio lengths [B]
-            
+            gop_targets: Optional list of per-phoneme GOP score tensors [P_i]
+
         Returns:
             Dictionary containing:
                 - 'total_loss': Combined weighted loss
-                - 'aug_loss': Augmentation prediction loss
-                - 'mask_loss': Masked reconstruction loss  
-                - 'contrastive_loss': Contrastive loss
-                - Additional metrics per objective
+                - 'aug_*': Augmentation prediction losses
+                - 'mask_*': Masked reconstruction losses
+                - 'contrastive_*': Contrastive losses
+                - 'gop_*': GOP prediction losses (if enabled)
         """
         B = waveform.shape[0]
         device = waveform.device
         losses = {}
-        
+
         # --- Augmentation Prediction Objective ---
         if self.aug_head is not None:
             aug_losses = self._compute_augmentation_loss(waveform, gammas, lengths)
             losses.update({f'aug_{k}': v for k, v in aug_losses.items()})
-        
+
         # --- Masked Reconstruction Objective ---
         if self.mask_module is not None:
             mask_losses = self._compute_mask_loss(waveform, gammas, lengths)
             losses.update({f'mask_{k}': v for k, v in mask_losses.items()})
-        
+
         # --- Contrastive Objective ---
         if self.contrastive_module is not None:
             contrastive_losses = self._compute_contrastive_loss(waveform, lengths)
             losses.update({f'contrastive_{k}': v for k, v in contrastive_losses.items()})
-        
+
+        # --- GOP Prediction Objective ---
+        if self.gop_head is not None and gammas is not None and gop_targets is not None:
+            gop_losses = self._compute_gop_loss(waveform, gammas, lengths, gop_targets)
+            losses.update({f'gop_{k}': v for k, v in gop_losses.items()})
+
         # Combine losses
         total_loss = torch.tensor(0.0, device=device)
-        
+
         if 'aug_total_loss' in losses:
             total_loss = total_loss + self.config.aug_loss_weight * losses['aug_total_loss']
-        
+
         if 'mask_loss' in losses:
             total_loss = total_loss + self.config.mask_loss_weight * losses['mask_loss']
         
         if 'contrastive_loss' in losses:
             total_loss = total_loss + self.config.contrastive_loss_weight * losses['contrastive_loss']
-        
+
+        if 'gop_loss' in losses:
+            total_loss = total_loss + self.config.gop_loss_weight * losses['gop_loss']
+
         losses['total_loss'] = total_loss
-        
+
         return losses
     
     def _compute_augmentation_loss(
@@ -477,7 +502,19 @@ class ClinicalSpeechSSL(nn.Module):
         loss_dict = self.contrastive_module(features_a, features_b)
         
         return loss_dict
-    
+
+    def _compute_gop_loss(
+        self,
+        waveform: torch.Tensor,
+        gammas: List[torch.Tensor],
+        lengths: Optional[torch.Tensor],
+        gop_targets: List[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Compute GOP prediction loss."""
+        features = self.encode(waveform, lengths)
+        predictions = self.gop_head(features, gammas)
+        return self.gop_loss(predictions, gop_targets)
+
     def get_representations(
         self,
         waveform: torch.Tensor,
