@@ -35,6 +35,7 @@ from clinical_speech_ssl.data.augmentations import (
     SafeAugmentor,
     AugmentationConfig,
     CLINICAL_AUGMENTATIONS,
+    CLINICAL_AUGMENTATION_INDEX,
 )
 
 
@@ -141,7 +142,6 @@ class ClinicalSpeechSSL(nn.Module):
                 embed_dim=config.embed_dim,
                 num_augmentation_types=config.num_augmentation_types,
                 predict_magnitude=config.predict_magnitude,
-                num_phoneme_regions=None,  # Set dynamically based on gamma
             )
             self.aug_loss = AugmentationPredictionLoss(
                 per_region=config.augmentation_per_region,
@@ -352,50 +352,68 @@ class ClinicalSpeechSSL(nn.Module):
         """Compute augmentation prediction loss."""
         B = waveform.shape[0]
         device = waveform.device
-        
-        # Apply augmentations and get targets
+        num_aug_types = self.config.num_augmentation_types
+
+        # Apply augmentations and collect per-region labels
         augmented_waveforms = []
-        aug_targets = {
-            'presence': [],
-            'magnitude': [],
-        }
-        
+        all_region_labels = []  # per-sample list of RegionAugmentationLabel
+
         for i in range(B):
             wav_i = waveform[i]
             gamma_i = gammas[i] if gammas is not None else None
-            
-            # Apply regional augmentation
             result = self.region_augmentor(wav_i, gamma_i)
             augmented_waveforms.append(result.waveform)
-            
-            # Build targets
-            presence = torch.zeros(self.config.num_augmentation_types, device=device)
-            magnitude = torch.zeros(self.config.num_augmentation_types, device=device)
-            
-            for j, aug_type in enumerate(CLINICAL_AUGMENTATIONS):
-                if aug_type.value in result.labels:
-                    param = result.labels[aug_type.value]
-                    if param != 0.0:
-                        presence[j] = 1.0
-                        magnitude[j] = param
-            
-            aug_targets['presence'].append(presence)
-            aug_targets['magnitude'].append(magnitude)
-        
-        # Stack augmented waveforms
+            all_region_labels.append(result.region_labels)
+
         augmented_waveforms = torch.stack(augmented_waveforms)
-        aug_targets['presence'] = torch.stack(aug_targets['presence'])
-        aug_targets['magnitude'] = torch.stack(aug_targets['magnitude'])
-        
+        # Augmentation is region-level; total waveform length must be preserved
+        assert augmented_waveforms.shape == waveform.shape, (
+            f"Augmented shape {augmented_waveforms.shape} != original {waveform.shape}"
+        )
+
         # Encode augmented audio
         features = self.encode(augmented_waveforms, lengths)
-        
-        # Predict augmentations
-        predictions = self.aug_head(features, lengths=lengths)
-        
-        # Compute loss
-        loss_dict = self.aug_loss(predictions, aug_targets)
-        
+        T_feat = features.shape[1]
+        # Approximate samples-per-frame from frontend downsampling
+        samples_per_frame = waveform.shape[1] // T_feat if T_feat > 0 else 1
+
+        # Build per-region masks and targets
+        # Each sample may have a different number of region labels K_i.
+        # We pad to the max K across the batch.
+        max_K = max(len(rl) for rl in all_region_labels) if all_region_labels else 1
+        max_K = max(max_K, 1)
+
+        region_masks = torch.zeros(B, max_K, T_feat, device=device)
+        presence_targets = torch.zeros(B, max_K, num_aug_types, device=device)
+        magnitude_targets = torch.zeros(B, max_K, num_aug_types, device=device)
+        is_transition = torch.zeros(B, max_K, dtype=torch.bool, device=device)
+        valid_mask = torch.zeros(B, max_K, dtype=torch.bool, device=device)
+
+        for i, rlabels in enumerate(all_region_labels):
+            for k, rl in enumerate(rlabels):
+                start_frame = rl.start_sample // samples_per_frame
+                end_frame = min(rl.end_sample // samples_per_frame + 1, T_feat)
+                region_masks[i, k, start_frame:end_frame] = 1.0
+
+                j = CLINICAL_AUGMENTATION_INDEX.get(rl.aug_type)
+                if j is not None:
+                    presence_targets[i, k, j] = 1.0
+                    magnitude_targets[i, k, j] = rl.param_normalized
+                is_transition[i, k] = rl.is_transition
+                valid_mask[i, k] = True
+
+        # Predict augmentations per region
+        predictions = self.aug_head.forward_with_regions(
+            features, region_masks, valid_mask,
+        )
+
+        aug_targets = {
+            'presence': presence_targets,
+            'magnitude': magnitude_targets,
+        }
+
+        loss_dict = self.aug_loss(predictions, aug_targets, is_transition=is_transition)
+
         return loss_dict
     
     def _compute_mask_loss(

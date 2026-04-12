@@ -49,6 +49,9 @@ class ClinicalSpeechDataset(Dataset):
     Or provide a manifest file listing all samples.
     """
     
+    # Waveform CNN default downsampling factor (20ms frames at 16kHz)
+    SAMPLES_PER_FRAME = 320
+
     def __init__(
         self,
         data_root: Optional[Union[str, Path]] = None,
@@ -58,6 +61,7 @@ class ClinicalSpeechDataset(Dataset):
         min_length_sec: float = 0.5,
         load_clinical_labels: bool = True,
         transform: Optional[Callable] = None,
+        gamma_mismatch_policy: str = "truncate",
     ):
         """
         Args:
@@ -68,8 +72,11 @@ class ClinicalSpeechDataset(Dataset):
             min_length_sec: Minimum audio length in seconds
             load_clinical_labels: Whether to load clinical labels from metadata
             transform: Optional transform to apply to samples
+            gamma_mismatch_policy: How to handle gamma/waveform length mismatches.
+                "raise" — error, "truncate" — fix silently, "warn" — fix with warning.
         """
         self.sample_rate = sample_rate
+        self.gamma_mismatch_policy = gamma_mismatch_policy
         self.max_length = int(max_length_sec * sample_rate)
         self.min_length = int(min_length_sec * sample_rate)
         self.load_clinical_labels = load_clinical_labels
@@ -154,11 +161,56 @@ class ClinicalSpeechDataset(Dataset):
         """Load gamma matrix from file."""
         path = Path(gamma_path)
         if path.suffix == ".pt":
-            return torch.load(gamma_path)
+            return torch.load(gamma_path, weights_only=True)
         elif path.suffix == ".npy":
             return torch.from_numpy(np.load(gamma_path))
         else:
             raise ValueError(f"Unsupported gamma format: {path.suffix}")
+
+    def _validate_gamma(
+        self, gamma: torch.Tensor, waveform: torch.Tensor, sample_id: str = "",
+    ) -> torch.Tensor:
+        """Validate and fix gamma shape relative to waveform length.
+
+        Expected: gamma.shape[0] ≈ waveform.shape[0] // SAMPLES_PER_FRAME.
+        Allows ±2 frame tolerance for rounding.
+
+        Returns:
+            Possibly truncated/padded gamma tensor.
+        """
+        assert gamma.dim() == 2, f"Gamma must be 2D (T, P), got shape {gamma.shape}"
+        expected_frames = waveform.shape[0] // self.SAMPLES_PER_FRAME
+        actual_frames = gamma.shape[0]
+        diff = abs(actual_frames - expected_frames)
+
+        if diff <= 2:
+            # Within rounding tolerance — truncate or pad to match exactly
+            if actual_frames > expected_frames:
+                gamma = gamma[:expected_frames]
+            elif actual_frames < expected_frames:
+                pad = torch.zeros(expected_frames - actual_frames, gamma.shape[1])
+                gamma = torch.cat([gamma, pad], dim=0)
+            return gamma
+
+        msg = (
+            f"Gamma frame count mismatch for '{sample_id}': "
+            f"gamma has {actual_frames} frames but waveform implies "
+            f"{expected_frames} (waveform_len={waveform.shape[0]}, "
+            f"spf={self.SAMPLES_PER_FRAME})"
+        )
+
+        if self.gamma_mismatch_policy == "raise":
+            raise ValueError(msg)
+        if self.gamma_mismatch_policy == "warn":
+            import warnings
+            warnings.warn(msg)
+        # truncate policy (or warn+continue)
+        if actual_frames > expected_frames:
+            gamma = gamma[:expected_frames]
+        else:
+            pad = torch.zeros(expected_frames - actual_frames, gamma.shape[1])
+            gamma = torch.cat([gamma, pad], dim=0)
+        return gamma
     
     def __getitem__(self, idx: int) -> SpeechSample:
         sample_info = self.samples[idx]
@@ -188,11 +240,11 @@ class ClinicalSpeechDataset(Dataset):
             pad_length = self.min_length - waveform.shape[0]
             waveform = torch.nn.functional.pad(waveform, (0, pad_length))
         
-        # Load gamma matrix
+        # Load gamma matrix and validate shape
         gamma = self._load_gamma(sample_info["gamma_path"])
-        
-        # Adjust gamma length to match waveform if needed
-        # (This depends on how gamma was computed - frames vs samples)
+        gamma = self._validate_gamma(
+            gamma, waveform, sample_id=sample_info.get("audio_path", str(idx)),
+        )
         
         sample = SpeechSample(
             waveform=waveform,

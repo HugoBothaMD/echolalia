@@ -181,9 +181,6 @@ class ReconstructionHead(nn.Module):
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
         dropout: float = 0.1,
-        use_quantizer: bool = False,
-        num_codes: int = 320,
-        codebook_dim: int = 256,
     ):
         """
         Args:
@@ -192,22 +189,18 @@ class ReconstructionHead(nn.Module):
             hidden_dim: Hidden layer dimension
             num_layers: Number of MLP layers
             dropout: Dropout probability
-            use_quantizer: Whether to predict quantized codes
-            num_codes: Number of codes in codebook (if use_quantizer)
-            codebook_dim: Codebook embedding dimension
         """
         super().__init__()
-        
+
         self.embed_dim = embed_dim
         self.target_dim = target_dim
-        self.use_quantizer = use_quantizer
-        
+
         hidden_dim = hidden_dim or embed_dim
-        
+
         # Build projection network
         layers = []
         current_dim = embed_dim
-        
+
         for i in range(num_layers - 1):
             layers.extend([
                 nn.Linear(current_dim, hidden_dim),
@@ -216,18 +209,9 @@ class ReconstructionHead(nn.Module):
                 nn.Dropout(dropout),
             ])
             current_dim = hidden_dim
-        
-        # Final projection
-        if use_quantizer:
-            layers.append(nn.Linear(current_dim, num_codes))
-        else:
-            layers.append(nn.Linear(current_dim, target_dim))
-        
+
+        layers.append(nn.Linear(current_dim, target_dim))
         self.projection = nn.Sequential(*layers)
-        
-        # Optional codebook for quantization
-        if use_quantizer:
-            self.codebook = nn.Embedding(num_codes, codebook_dim)
     
     def forward(
         self,
@@ -260,18 +244,14 @@ class ReconstructionHead(nn.Module):
     ) -> torch.Tensor:
         """
         Get reconstruction targets.
-        
+
         Args:
             original_features: Original input features [B, T, D]
             mask: Mask indicating which frames to reconstruct [B, T]
-            
+
         Returns:
             targets: Target values for masked frames
         """
-        if self.use_quantizer:
-            # Would need to quantize original features first
-            raise NotImplementedError("Quantizer targets not implemented")
-        
         return original_features
 
 
@@ -279,25 +259,22 @@ class MaskedReconstructionLoss(nn.Module):
     """
     Loss function for masked reconstruction objective.
     """
-    
+
     def __init__(
         self,
         use_cosine: bool = True,
         temperature: float = 0.1,
-        use_quantizer: bool = False,
     ):
         """
         Args:
             use_cosine: If True, use cosine similarity loss
             temperature: Temperature for cosine similarity
-            use_quantizer: If True, use cross-entropy for code prediction
         """
         super().__init__()
-        
+
         self.use_cosine = use_cosine
         self.temperature = temperature
-        self.use_quantizer = use_quantizer
-    
+
     def forward(
         self,
         predictions: torch.Tensor,
@@ -306,46 +283,27 @@ class MaskedReconstructionLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Compute reconstruction loss.
-        
+
         Args:
             predictions: Model predictions [B, T, D]
             targets: Target values [B, T, D]
             mask: Boolean mask [B, T] where True = masked
-            
+
         Returns:
-            Dictionary with 'loss', 'accuracy' (if quantizer)
+            Dictionary with 'loss'
         """
-        if self.use_quantizer:
-            # Cross-entropy loss for code prediction
-            predictions_flat = predictions[mask]  # [N, num_codes]
-            targets_flat = targets[mask]  # [N]
-            
-            loss = F.cross_entropy(predictions_flat, targets_flat)
-            
-            # Compute accuracy
-            with torch.no_grad():
-                pred_codes = predictions_flat.argmax(dim=-1)
-                accuracy = (pred_codes == targets_flat).float().mean()
-            
-            return {'loss': loss, 'accuracy': accuracy}
-        
+        predictions_masked = predictions[mask]  # [N, D]
+        targets_masked = targets[mask]  # [N, D]
+
+        if self.use_cosine:
+            predictions_norm = F.normalize(predictions_masked, dim=-1)
+            targets_norm = F.normalize(targets_masked, dim=-1)
+            similarity = (predictions_norm * targets_norm).sum(dim=-1)
+            loss = (1 - similarity).mean()
         else:
-            # Continuous reconstruction
-            predictions_masked = predictions[mask]  # [N, D]
-            targets_masked = targets[mask]  # [N, D]
-            
-            if self.use_cosine:
-                # Cosine similarity loss
-                predictions_norm = F.normalize(predictions_masked, dim=-1)
-                targets_norm = F.normalize(targets_masked, dim=-1)
-                
-                similarity = (predictions_norm * targets_norm).sum(dim=-1)
-                loss = (1 - similarity).mean()
-            else:
-                # MSE loss
-                loss = F.mse_loss(predictions_masked, targets_masked)
-            
-            return {'loss': loss}
+            loss = F.mse_loss(predictions_masked, targets_masked)
+
+        return {'loss': loss}
 
 
 class MaskedPredictionModule(nn.Module):

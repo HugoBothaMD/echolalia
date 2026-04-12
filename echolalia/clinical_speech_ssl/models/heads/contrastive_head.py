@@ -190,24 +190,21 @@ class ContrastiveHead(nn.Module):
 class ContrastiveLoss(nn.Module):
     """
     InfoNCE contrastive loss.
-    
+
     Supports both standard and supervised contrastive loss.
     """
-    
+
     def __init__(
         self,
         temperature: float = 0.07,
-        use_hard_negatives: bool = False,
     ):
         """
         Args:
             temperature: Temperature scaling
-            use_hard_negatives: Whether to mine hard negatives
         """
         super().__init__()
-        
+
         self.temperature = temperature
-        self.use_hard_negatives = use_hard_negatives
     
     def forward(
         self,

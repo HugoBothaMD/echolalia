@@ -10,10 +10,12 @@ from clinical_speech_ssl.data.augmentations import (
     AugmentationType,
     AugmentationConfig,
     AugmentationResult,
+    RegionAugmentationLabel,
     AudioAugmentor,
     RegionAugmentor,
     SafeAugmentor,
     CLINICAL_AUGMENTATIONS,
+    CLINICAL_AUGMENTATION_INDEX,
     SAFE_AUGMENTATIONS,
 )
 
@@ -25,9 +27,11 @@ __all__ = [
     "AugmentationType",
     "AugmentationConfig",
     "AugmentationResult",
+    "RegionAugmentationLabel",
     "AudioAugmentor",
     "RegionAugmentor",
     "SafeAugmentor",
     "CLINICAL_AUGMENTATIONS",
+    "CLINICAL_AUGMENTATION_INDEX",
     "SAFE_AUGMENTATIONS",
 ]

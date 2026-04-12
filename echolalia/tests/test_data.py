@@ -12,10 +12,13 @@ from pathlib import Path
 from clinical_speech_ssl.data.augmentations import (
     AugmentationType,
     AugmentationConfig,
+    AugmentationResult,
+    RegionAugmentationLabel,
     AudioAugmentor,
     RegionAugmentor,
     SafeAugmentor,
     CLINICAL_AUGMENTATIONS,
+    CLINICAL_AUGMENTATION_INDEX,
     SAFE_AUGMENTATIONS,
 )
 from clinical_speech_ssl.data.dataset import (
@@ -44,7 +47,19 @@ class TestAugmentationTypes:
     
     def test_no_overlap(self):
         """Test that clinical and safe augmentations don't overlap."""
-        assert len(CLINICAL_AUGMENTATIONS & SAFE_AUGMENTATIONS) == 0
+        assert len(set(CLINICAL_AUGMENTATIONS) & set(SAFE_AUGMENTATIONS)) == 0
+
+    def test_clinical_augmentations_are_ordered(self):
+        """Test that CLINICAL_AUGMENTATIONS is an ordered tuple (not a set)."""
+        assert isinstance(CLINICAL_AUGMENTATIONS, tuple)
+        # Verify deterministic ordering
+        assert list(CLINICAL_AUGMENTATIONS) == list(CLINICAL_AUGMENTATIONS)
+        assert CLINICAL_AUGMENTATION_INDEX[AugmentationType.TIME_STRETCH] == 0
+
+    def test_safe_augmentations_are_ordered(self):
+        """Test that SAFE_AUGMENTATIONS is an ordered tuple without REVERB."""
+        assert isinstance(SAFE_AUGMENTATIONS, tuple)
+        assert AugmentationType.REVERB not in SAFE_AUGMENTATIONS
 
 
 class TestAugmentationConfig:
@@ -282,11 +297,46 @@ class TestRegionAugmentor:
             num_regions=2,
             num_augs_per_region=1,
         )
-        
+
         assert result.waveform.shape == sample_waveform.shape
         assert len(result.labels) == len(CLINICAL_AUGMENTATIONS)
         assert result.regions is not None
         assert len(result.regions) == 2
+
+    def test_region_labels_are_populated(self, region_augmentor, sample_waveform, sample_gamma):
+        """Test that per-region labels are stored properly (Fix 2)."""
+        result = region_augmentor(
+            sample_waveform,
+            sample_gamma,
+            num_regions=3,
+            num_augs_per_region=1,
+        )
+
+        assert len(result.region_labels) >= 3
+        for rl in result.region_labels:
+            assert isinstance(rl, RegionAugmentationLabel)
+            assert rl.start_sample >= 0
+            assert rl.end_sample > rl.start_sample
+            assert rl.aug_type in CLINICAL_AUGMENTATIONS
+            assert isinstance(rl.is_transition, bool)
+
+    def test_region_labels_preserve_duplicates(self, region_augmentor, sample_waveform, sample_gamma):
+        """Test that if two regions get the same aug type, both are preserved."""
+        np.random.seed(42)
+        # Request many regions to increase chance of same-type collision
+        result = region_augmentor(
+            sample_waveform,
+            sample_gamma,
+            num_regions=8,
+            num_augs_per_region=1,
+        )
+
+        # At 8 regions picking from 4 types, collisions are inevitable
+        from collections import Counter
+        type_counts = Counter(rl.aug_type for rl in result.region_labels)
+        assert any(c > 1 for c in type_counts.values()), (
+            "Expected at least one augmentation type to appear in multiple regions"
+        )
 
 
 class TestSafeAugmentor:
@@ -406,11 +456,72 @@ class TestSSLCollator:
         assert batch['clinical_labels']['severity'].shape == (2,)
 
 
+class TestGammaValidation:
+    """Test gamma shape validation (Fix 6) — unit tests on _validate_gamma directly."""
+
+    def _make_dataset(self):
+        """Build a minimal dataset to access _validate_gamma."""
+        # Create with an empty manifest (no file I/O needed for unit tests)
+        import types
+        ds = ClinicalSpeechDataset.__new__(ClinicalSpeechDataset)
+        ds.sample_rate = 16000
+        ds.gamma_mismatch_policy = "truncate"
+        ds.SAMPLES_PER_FRAME = 320
+        return ds
+
+    def test_gamma_validation_pass(self):
+        """Correctly-sized gamma passes unchanged."""
+        ds = self._make_dataset()
+        ds.gamma_mismatch_policy = "raise"
+        waveform = torch.randn(16000)  # 16000 / 320 = 50 frames
+        gamma = torch.softmax(torch.randn(50, 10), dim=-1)
+        result = ds._validate_gamma(gamma, waveform)
+        assert result.shape[0] == 50
+
+    def test_gamma_validation_small_slack(self):
+        """Gamma within ±2 frame tolerance is silently fixed."""
+        ds = self._make_dataset()
+        ds.gamma_mismatch_policy = "raise"
+        waveform = torch.randn(16000)  # 50 frames expected
+        gamma = torch.softmax(torch.randn(52, 10), dim=-1)  # 2 extra — within tolerance
+        result = ds._validate_gamma(gamma, waveform)
+        assert result.shape[0] == 50
+
+    def test_gamma_validation_truncate(self):
+        """Large overshoot is truncated under 'truncate' policy."""
+        ds = self._make_dataset()
+        ds.gamma_mismatch_policy = "truncate"
+        waveform = torch.randn(16000)  # 50 frames expected
+        gamma = torch.softmax(torch.randn(80, 10), dim=-1)
+        result = ds._validate_gamma(gamma, waveform)
+        assert result.shape[0] == 50
+
+    def test_gamma_validation_pad(self):
+        """Large undershoot is zero-padded under 'truncate' policy."""
+        ds = self._make_dataset()
+        ds.gamma_mismatch_policy = "truncate"
+        waveform = torch.randn(16000)  # 50 frames expected
+        gamma = torch.softmax(torch.randn(30, 10), dim=-1)
+        result = ds._validate_gamma(gamma, waveform)
+        assert result.shape[0] == 50
+
+    def test_gamma_validation_raise(self):
+        """Large mismatch raises ValueError under 'raise' policy."""
+        ds = self._make_dataset()
+        ds.gamma_mismatch_policy = "raise"
+        waveform = torch.randn(16000)
+        gamma = torch.softmax(torch.randn(100, 10), dim=-1)
+        with pytest.raises(ValueError, match="Gamma frame count mismatch"):
+            ds._validate_gamma(gamma, waveform)
+
+
 class TestDatasetIntegration:
     """Integration tests for dataset functionality."""
     
     def test_manifest_loading(self, tmp_path):
         """Test loading from manifest file."""
+        import scipy.io.wavfile
+
         # Create dummy manifest
         manifest = {
             'metadata': {'version': '1.0'},
@@ -422,12 +533,11 @@ class TestDatasetIntegration:
                 },
             ]
         }
-        
+
         # Create dummy files
-        import torchaudio
         waveform = torch.randn(1, 16000)
-        torchaudio.save(str(tmp_path / 'audio1.wav'), waveform, 16000)
-        torch.save(torch.randn(50, 10), str(tmp_path / 'gamma1.pt'))
+        scipy.io.wavfile.write(str(tmp_path / 'audio1.wav'), 16000, waveform.squeeze(0).numpy())
+        torch.save(torch.softmax(torch.randn(50, 10), dim=-1), str(tmp_path / 'gamma1.pt'))
         
         manifest_path = tmp_path / 'manifest.json'
         with open(manifest_path, 'w') as f:
