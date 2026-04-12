@@ -12,6 +12,9 @@ from clinical_speech_ssl.models.frontends.spectrogram_patcher import (
     ViTStylePatcher,
     SpectrogramPatchFrontend,
 )
+from clinical_speech_ssl.models.frontends.wavlm_frontend import (
+    WavLMFrontend,
+)
 
 __all__ = [
     "WaveformCNNFrontend",
@@ -22,4 +25,5 @@ __all__ = [
     "TallNarrowPatcher",
     "ViTStylePatcher",
     "SpectrogramPatchFrontend",
+    "WavLMFrontend",
 ]

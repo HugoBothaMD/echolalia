@@ -15,6 +15,7 @@ from clinical_speech_ssl.models.frontends import (
     WaveformCNNFrontendSmall,
     WaveformCNNFrontendLarge,
     SpectrogramPatchFrontend,
+    WavLMFrontend,
 )
 from clinical_speech_ssl.models.encoders import (
     TransformerEncoder,
@@ -52,9 +53,13 @@ class ClinicalSpeechSSLConfig:
     sample_rate: int = 16000
     
     # Frontend configuration
-    frontend_type: Literal["cnn_small", "cnn_base", "cnn_large", 
-                          "patch_tall_narrow", "patch_vit"] = "cnn_base"
+    frontend_type: Literal["cnn_small", "cnn_base", "cnn_large",
+                          "patch_tall_narrow", "patch_vit",
+                          "wavlm_base", "wavlm_large"] = "cnn_base"
     frontend_dropout: float = 0.0
+    wavlm_model_name: str = "microsoft/wavlm-base-plus"
+    freeze_frontend: bool = True
+    wavlm_output_layer: int = -1
     
     # Encoder configuration
     encoder_type: Literal["transformer_small", "transformer_base", "transformer_large",
@@ -189,7 +194,25 @@ class ClinicalSpeechSSL(nn.Module):
     def _build_frontend(self) -> nn.Module:
         """Build input frontend based on config."""
         config = self.config
-        
+
+        # WavLM frontends (work with input_type="waveform")
+        if config.frontend_type in ("wavlm_base", "wavlm_large"):
+            model_map = {
+                "wavlm_base": "microsoft/wavlm-base-plus",
+                "wavlm_large": "microsoft/wavlm-large",
+            }
+            model_name = config.wavlm_model_name
+            if model_name == "microsoft/wavlm-base-plus":
+                # Use the preset default if user didn't override
+                model_name = model_map.get(config.frontend_type, model_name)
+            return WavLMFrontend(
+                model_name=model_name,
+                output_dim=config.embed_dim,
+                freeze=config.freeze_frontend,
+                output_layer=config.wavlm_output_layer,
+                dropout=config.frontend_dropout,
+            )
+
         if config.input_type == "waveform":
             if config.frontend_type == "cnn_small":
                 return WaveformCNNFrontendSmall(
@@ -208,7 +231,7 @@ class ClinicalSpeechSSL(nn.Module):
                 )
             else:
                 raise ValueError(f"Unknown frontend type for waveform: {config.frontend_type}")
-        
+
         elif config.input_type == "spectrogram":
             patch_type = "tall_narrow" if "tall_narrow" in config.frontend_type else "vit"
             return SpectrogramPatchFrontend(
@@ -223,7 +246,7 @@ class ClinicalSpeechSSL(nn.Module):
                 embed_dim=config.embed_dim,
                 dropout=config.frontend_dropout,
             )
-        
+
         else:
             raise ValueError(f"Unknown input type: {config.input_type}")
     
@@ -261,7 +284,28 @@ class ClinicalSpeechSSL(nn.Module):
             )
         else:
             raise ValueError(f"Unknown encoder type: {config.encoder_type}")
-    
+
+    def freeze_frontend(self):
+        """Freeze the frontend (useful for WavLM to train only the encoder + heads)."""
+        if isinstance(self.frontend, WavLMFrontend):
+            self.frontend.freeze()
+        else:
+            for param in self.frontend.parameters():
+                param.requires_grad = False
+
+    def unfreeze_frontend(self, num_layers: Optional[int] = None):
+        """Unfreeze the frontend for fine-tuning.
+
+        Args:
+            num_layers: For WavLM, only unfreeze the top N transformer layers.
+                If None, unfreeze everything. Ignored for non-WavLM frontends.
+        """
+        if isinstance(self.frontend, WavLMFrontend):
+            self.frontend.unfreeze(num_layers)
+        else:
+            for param in self.frontend.parameters():
+                param.requires_grad = True
+
     def encode(
         self,
         waveform: torch.Tensor,
@@ -612,6 +656,18 @@ def create_ssl_model(
             "frontend_type": "cnn_large",
             "encoder_type": "conformer_large",
             "embed_dim": 512,
+        },
+        "wavlm_base": {
+            "frontend_type": "wavlm_base",
+            "encoder_type": "conformer_medium",
+            "embed_dim": 256,
+            "freeze_frontend": True,
+        },
+        "wavlm_large": {
+            "frontend_type": "wavlm_large",
+            "encoder_type": "conformer_medium",
+            "embed_dim": 256,
+            "freeze_frontend": True,
         },
     }
     

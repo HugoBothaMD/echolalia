@@ -37,11 +37,14 @@ def build_model_config(raw: Dict[str, Any]) -> ClinicalSpeechSSLConfig:
     for key in (
         "input_type", "frontend_type", "encoder_type", "embed_dim",
         "frontend_dropout", "encoder_dropout",
+        "wavlm_model_name", "freeze_frontend", "wavlm_output_layer",
         "use_augmentation_prediction", "use_masked_reconstruction", "use_contrastive",
+        "use_gop_prediction",
         "num_augmentation_types", "augmentation_per_region", "predict_magnitude",
         "mask_prob", "mask_span_length", "transition_bias",
         "contrastive_projection_dim", "contrastive_temperature",
         "aug_loss_weight", "mask_loss_weight", "contrastive_loss_weight",
+        "gop_loss_weight",
     ):
         if key in model_cfg:
             kwargs[key] = model_cfg[key]
