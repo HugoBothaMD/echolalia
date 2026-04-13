@@ -28,7 +28,8 @@ class AugmentationType(Enum):
     PITCH_SHIFT = "pitch_shift"
     FORMANT_SHIFT = "formant_shift"
     AMPLITUDE_MOD = "amplitude_mod"
-    
+    REPETITION = "repetition"  # Echolalia/stuttering-style region duplication
+
     # Safe augmentations (affect recording conditions only)
     ADDITIVE_NOISE = "additive_noise"
     REVERB = "reverb"
@@ -42,6 +43,7 @@ CLINICAL_AUGMENTATIONS = (
     AugmentationType.PITCH_SHIFT,
     AugmentationType.FORMANT_SHIFT,
     AugmentationType.AMPLITUDE_MOD,
+    AugmentationType.REPETITION,
 )
 
 CLINICAL_AUGMENTATION_INDEX = {
@@ -88,6 +90,11 @@ class AugmentationConfig:
     
     # High-pass filter: cutoff frequency Hz
     high_pass_range: Tuple[float, float] = (50.0, 200.0)
+
+    # Repetition: number of additional region copies inserted (1 = repeat once extra, etc.)
+    repetition_count_range: Tuple[int, int] = (1, 3)
+    # Crossfade length in samples for smooth splicing (~10ms at 16kHz)
+    repetition_crossfade_samples: int = 160
 
 
 @dataclass
@@ -333,7 +340,96 @@ class AudioAugmentor(nn.Module):
             
         normalized = self._normalize_param(depth, self.config.amplitude_mod_range)
         return modulated, normalized
-    
+
+    def repeat_region(
+        self,
+        waveform: torch.Tensor,
+        count: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        Apply echolalia/stuttering-style repetition: fit `count+1` copies of
+        a compressed version of the region into the same length slot. The
+        compression (time-stretching faster) is what enables multiple
+        repetitions to fit while preserving total length — the signature
+        of pathological repetition (e.g., "pl-pl-please").
+
+        Args:
+            waveform: Input region waveform [T] or [C, T]
+            count: Number of EXTRA repetitions (1 = one extra copy = 2 total copies).
+                If None, sampled from config.repetition_count_range.
+
+        Returns:
+            Tuple of (repeated waveform (same length as input), normalized count)
+        """
+        if count is None:
+            low, high = self.config.repetition_count_range
+            count = int(np.random.randint(low, high + 1))
+
+        squeeze = False
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+            squeeze = True
+
+        original_len = waveform.shape[-1]
+        num_copies = count + 1  # total number of repetitions
+        piece_len = original_len // num_copies
+
+        if piece_len < 2:
+            # Region too short to meaningfully repeat; return unchanged
+            if squeeze:
+                waveform = waveform.squeeze(0)
+            low, high = self.config.repetition_count_range
+            normalized = self._normalize_param(float(count), (float(low), float(high)))
+            return waveform, normalized
+
+        # Resample the region to piece_len via linear interpolation
+        # [C, T] -> [C, 1, T] for interpolate -> [C, 1, piece_len] -> [C, piece_len]
+        compressed = F.interpolate(
+            waveform.unsqueeze(1),
+            size=piece_len,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(1)
+
+        crossfade = min(
+            self.config.repetition_crossfade_samples,
+            piece_len // 4,
+        )
+
+        # Concatenate num_copies copies with crossfade at seams
+        if crossfade > 0:
+            fade_out = torch.linspace(1.0, 0.0, crossfade, device=waveform.device)
+            fade_in = 1.0 - fade_out
+
+        pieces = [compressed.clone()]
+        for _ in range(count):
+            if crossfade > 0:
+                tail = pieces[-1][..., -crossfade:]
+                head = compressed[..., :crossfade]
+                blended = tail * fade_out + head * fade_in
+                pieces[-1] = pieces[-1][..., :-crossfade]
+                pieces.append(blended)
+                pieces.append(compressed[..., crossfade:])
+            else:
+                pieces.append(compressed)
+
+        repeated = torch.cat(pieces, dim=-1)
+
+        # Fit to original length (tiny rounding from integer division)
+        if repeated.shape[-1] > original_len:
+            repeated = repeated[..., :original_len]
+        elif repeated.shape[-1] < original_len:
+            pad_len = original_len - repeated.shape[-1]
+            repeated = F.pad(repeated, (0, pad_len))
+
+        if squeeze:
+            repeated = repeated.squeeze(0)
+
+        # Normalize count to [-1, 1]
+        low, high = self.config.repetition_count_range
+        normalized = self._normalize_param(float(count), (float(low), float(high)))
+        return repeated, normalized
+
     def add_noise(
         self,
         waveform: torch.Tensor,
@@ -588,6 +684,7 @@ class RegionAugmentor(nn.Module):
             AugmentationType.PITCH_SHIFT: self.augmentor.pitch_shift,
             AugmentationType.FORMANT_SHIFT: self.augmentor.formant_shift,
             AugmentationType.AMPLITUDE_MOD: self.augmentor.amplitude_modulation,
+            AugmentationType.REPETITION: self.augmentor.repeat_region,
             AugmentationType.ADDITIVE_NOISE: self.augmentor.add_noise,
             AugmentationType.GAIN: self.augmentor.apply_gain,
             AugmentationType.LOW_PASS: self.augmentor.apply_low_pass,

@@ -56,6 +56,11 @@ class TestAugmentationTypes:
         assert list(CLINICAL_AUGMENTATIONS) == list(CLINICAL_AUGMENTATIONS)
         assert CLINICAL_AUGMENTATION_INDEX[AugmentationType.TIME_STRETCH] == 0
 
+    def test_repetition_in_clinical_augmentations(self):
+        """Test that REPETITION is a clinical augmentation (Phase 3b)."""
+        assert AugmentationType.REPETITION in CLINICAL_AUGMENTATIONS
+        assert AugmentationType.REPETITION in CLINICAL_AUGMENTATION_INDEX
+
     def test_safe_augmentations_are_ordered(self):
         """Test that SAFE_AUGMENTATIONS is an ordered tuple without REVERB."""
         assert isinstance(SAFE_AUGMENTATIONS, tuple)
@@ -179,8 +184,43 @@ class TestAudioAugmentor:
             sample_audio_1d,
             cutoff_hz=100.0,
         )
-        
+
         assert filtered.shape == sample_audio_1d.shape
+
+    def test_repeat_region_preserves_length(self, augmentor, sample_audio_1d):
+        """Test that repetition preserves region length."""
+        repeated, param = augmentor.repeat_region(sample_audio_1d, count=2)
+        assert repeated.shape == sample_audio_1d.shape
+        assert -1 <= param <= 1
+
+    def test_repeat_region_changes_content(self, augmentor):
+        """Test that repetition produces content different from the input."""
+        t = torch.linspace(0, 1, 16000)
+        signal = torch.sin(2 * np.pi * 440 * t) * torch.linspace(0, 1, 16000)
+        repeated, _ = augmentor.repeat_region(signal, count=2)
+        assert not torch.allclose(repeated, signal)
+
+    def test_repeat_region_has_repeated_structure(self, augmentor):
+        """A repeated signal shows strong periodic self-similarity at the repeat lag."""
+        torch.manual_seed(42)
+        signal = torch.randn(3200)
+        count = 3  # 4 total copies, each 800 samples pre-crossfade
+        repeated, _ = augmentor.repeat_region(signal, count=count)
+        assert repeated.shape == signal.shape
+
+        # The signal repeats with period = piece_len - crossfade = 800 - 160 = 640
+        # Scan lags to find the best match (test is robust to crossfade config)
+        piece_len = 3200 // (count + 1)
+        best_corr = -1.0
+        for lag in range(piece_len // 2, piece_len + 50):
+            a = repeated[:1600 - lag]
+            b = repeated[lag:1600]
+            if len(a) < 100:
+                continue
+            c = torch.sum(a * b) / (torch.norm(a) * torch.norm(b) + 1e-8)
+            best_corr = max(best_corr, c.item())
+        # After repetition there's a strong lag with high correlation (near 1)
+        assert best_corr > 0.8, f"Expected strong repeat structure, got {best_corr}"
     
     def test_normalize_param(self, augmentor):
         """Test parameter normalization."""
@@ -331,12 +371,24 @@ class TestRegionAugmentor:
             num_augs_per_region=1,
         )
 
-        # At 8 regions picking from 4 types, collisions are inevitable
+        # With 8 regions picking from 5 types (after REPETITION was added),
+        # collisions are still likely
         from collections import Counter
         type_counts = Counter(rl.aug_type for rl in result.region_labels)
         assert any(c > 1 for c in type_counts.values()), (
             "Expected at least one augmentation type to appear in multiple regions"
         )
+
+    def test_region_apply_repetition(self, region_augmentor, sample_waveform):
+        """Test that REPETITION applied to a region preserves total length."""
+        augmented, param = region_augmentor.apply_to_region(
+            sample_waveform, 1000, 5000, AugmentationType.REPETITION,
+        )
+        assert augmented.shape == sample_waveform.shape
+        assert not torch.allclose(augmented[1000:5000], sample_waveform[1000:5000])
+        # Outside the region should be unchanged
+        assert torch.allclose(augmented[:1000], sample_waveform[:1000])
+        assert torch.allclose(augmented[5000:], sample_waveform[5000:])
 
 
 class TestSafeAugmentor:

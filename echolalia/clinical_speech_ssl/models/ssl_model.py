@@ -74,7 +74,7 @@ class ClinicalSpeechSSLConfig:
     use_gop_prediction: bool = False
     
     # Augmentation prediction config
-    num_augmentation_types: int = 4
+    num_augmentation_types: int = 5  # time_stretch, pitch_shift, formant_shift, amplitude_mod, repetition
     augmentation_per_region: bool = True
     predict_magnitude: bool = True
     

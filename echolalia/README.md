@@ -10,28 +10,31 @@ Standard speech SSL models (wav2vec 2.0, HuBERT, WavLM) learn invariance to acou
 
 ### Key Features
 
-- **Multiple input modalities**: Raw waveform (CNN frontend) or spectrogram patches (tall-narrow or ViT-style)
+- **Multiple input modalities**: Raw waveform (CNN or **pretrained WavLM**), or spectrogram patches (tall-narrow or ViT-style)
 - **Multiple encoder architectures**: Transformer and Conformer variants
-- **Three complementary SSL objectives**:
-  - **Augmentation Prediction**: Detect clinical-relevant perturbations (pitch, timing, formants)
+- **Four complementary SSL objectives**:
+  - **Augmentation Prediction**: Detect 5 clinical-relevant perturbations (pitch, timing, formants, tremor, **repetition/echolalia**)
   - **Masked Reconstruction**: Predict masked frames with transition bias
   - **Contrastive Learning**: Invariance to recording conditions via safe augmentations
+  - **GOP Prediction** (optional): Per-phoneme Goodness of Pronunciation supervision
+- **SoftAlign integration**: Offline preprocessing pipeline using `soft_align` for smooth gamma matrices, GOP targets, quality tiers, and clinical measures
 - **Transition-focused learning**: Bias toward phoneme boundaries using CTC soft alignments
 - **Downstream fine-tuning**: Classification, regression, and multi-task learning
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/mayo-speech-ai/clinical-speech-ssl.git
-cd clinical-speech-ssl
+# soft_align must be installed locally first (not on PyPI):
+git clone https://github.com/HugoBothaMD/soft_align.git
+cd soft_align && pip install -e . && cd ..
 
-# Install in development mode
+# Then install echolalia in development mode
+git clone https://github.com/HugoBothaMD/echolalia.git
+cd echolalia/echolalia
 pip install -e ".[dev]"
-
-# Or install dependencies directly
-pip install torch torchaudio numpy scipy librosa einops pyyaml tqdm tensorboard scikit-learn
 ```
+
+The package depends on `transformers` (for WavLM), `soft_align` (gamma + GOP + measures), `torch`, `torchaudio`, and `pyyaml` among others.
 
 ## Quick Start
 
@@ -158,6 +161,90 @@ representations = model.get_representations(
 frame_reps = model.encode(waveform, lengths)
 ```
 
+## Recommended Workflow
+
+The full pipeline initializes from pretrained WavLM, pretrains the conformer + SSL heads on a large clean corpus (LibriSpeech), optionally adapts to pathological speech, and finally fine-tunes on labeled clinical data.
+
+```
+WavLM (pretrained, frozen)
+  ↓
+Conformer encoder (random init)
+  ↓
+SSL heads: aug-pred (5 types) + masked-recon + contrastive + GOP
+  ↓
+Stage 1: Pretrain on LibriSpeech (clean, healthy, ~460h)
+  ↓
+Stage 2 (optional): Continue on unlabeled clinical speech (domain adapt)
+  ↓
+Stage 3: Fine-tune downstream head on labeled clinical data
+```
+
+### Stage 0 — Preprocess LibriSpeech with SoftAlign
+
+The preprocessing script runs your trained `PhonemeClassifierBackbone` over each audio file and produces gamma matrices (smooth, not peaky), per-phoneme GOP targets, utterance-level clinical measure vectors, and quality tiers — all in one backbone pass.
+
+```bash
+# 1. Build a transcripts.json from LibriSpeech's .trans.txt files
+python -m scripts.librispeech_transcripts \
+    --librispeech-root /data/LibriSpeech/train-clean-100 \
+    --output /data/LibriSpeech/train-clean-100.transcripts.json
+
+# 2. Run preprocessing
+python -m scripts.compute_alignments \
+    --audio-dir /data/LibriSpeech/train-clean-100 \
+    --transcripts /data/LibriSpeech/train-clean-100.transcripts.json \
+    --output-dir /data/LibriSpeech/train-clean-100.processed \
+    --backbone phoneme_classifier \
+    --classifier-checkpoint /path/to/your/best_classifier.pt \
+    --compute-gop --compute-measures --compute-quality
+```
+
+The script writes `manifest.json`, `alignments/*.pt`, `gop/*.pt`, and `measures/*.npy` to the output dir.
+
+### Stage 1 — Pretrain on LibriSpeech
+
+Point the training config's `data.manifest_path` at the processed manifest and run:
+
+```bash
+python -m clinical_speech_ssl.train --config configs/ssl_pretraining.yaml
+```
+
+Key config fields for stage 1:
+```yaml
+model:
+  frontend_type: "wavlm_base"   # or "wavlm_large"
+  freeze_frontend: true          # freeze WavLM, train conformer+heads
+  use_gop_prediction: true       # 4th objective with LibriSpeech-derived targets
+  num_augmentation_types: 5      # includes REPETITION
+
+data:
+  manifest_path: "/data/LibriSpeech/train-clean-100.processed/manifest.json"
+```
+
+### Stage 2 (optional) — Domain-adapt on unlabeled clinical speech
+
+Run the same preprocessing on your unlabeled clinical recordings, then continue training from the stage-1 checkpoint with the WavLM unfrozen:
+
+```python
+trainer.load_checkpoint("checkpoints/stage1/best_model.pt")
+trainer.model.unfreeze_frontend(num_layers=4)  # unfreeze top 4 WavLM layers
+trainer.train()
+```
+
+You can also filter out low-quality recordings:
+```python
+dataset = ClinicalSpeechDataset(
+    manifest_path="...",
+    min_quality_tier=2,           # MEDIUM and above (3=HIGH, 2=MED, 1=LOW, 0=FAILED)
+    load_gop_targets=True,
+    load_measure_targets=True,
+)
+```
+
+### Stage 3 — Fine-tune for downstream tasks
+
+Standard supervised fine-tuning on your labeled clinical task (see [Quick Start step 4](#4-downstream-fine-tuning)).
+
 ## Architecture
 
 ### Model Components
@@ -183,9 +270,26 @@ frame_reps = model.encode(waveform, lengths)
 |----------|-------------|----------|
 | `cnn_small` | 4-layer CNN, 256 dim | Fast experimentation |
 | `cnn_base` | 7-layer CNN, 512 dim | General use |
-| `cnn_large` | 7-layer CNN, 1024 dim | Best performance |
+| `cnn_large` | 7-layer CNN, 1024 dim | Best performance from scratch |
+| `wavlm_base` | Pretrained WavLM-base-plus (94M, 768 dim) | **Recommended starting point** |
+| `wavlm_large` | Pretrained WavLM-large (316M, 1024 dim) | Best results, larger memory |
 | `patch_tall_narrow` | Full freq, few time steps | Preserves spectral structure |
 | `patch_vit` | Square/rectangular patches | ViT-style, more general |
+
+**WavLM frontends** wrap pretrained `transformers.WavLMModel` and project to `embed_dim`. By default WavLM is frozen so only the conformer + SSL heads train, which is fast and data-efficient. Use `freeze_frontend: false` (or call `model.unfreeze_frontend(num_layers=N)`) to unfreeze for staged domain adaptation.
+
+```python
+config = ClinicalSpeechSSLConfig(
+    frontend_type="wavlm_base",
+    wavlm_model_name="microsoft/wavlm-base-plus",
+    freeze_frontend=True,  # frozen during stage 1
+    encoder_type="conformer_medium",
+    embed_dim=256,
+)
+model = ClinicalSpeechSSL(config)
+# Later, for clinical adaptation:
+model.unfreeze_frontend(num_layers=4)  # unfreeze top 4 WavLM layers
+```
 
 ### Encoder Options
 
@@ -200,14 +304,22 @@ frame_reps = model.encode(waveform, lengths)
 ### SSL Objectives
 
 #### 1. Augmentation Prediction
-Applies clinical-relevant augmentations (pitch shift, time stretch, formant shift) to phoneme regions and trains the model to detect and quantify them.
+Applies five clinical-relevant augmentations to phoneme regions and trains the model to detect and quantify them per region.
+
+| Augmentation | Mimics | Clinical correlate |
+|--------------|--------|---------------------|
+| `TIME_STRETCH` | Slowed/scanning speech | Bradykinesia, rate disorders |
+| `PITCH_SHIFT` | Monotone, pitch breaks | Prosodic disorders |
+| `FORMANT_SHIFT` | Vowel distortion, undershoot | Articulatory imprecision |
+| `AMPLITUDE_MOD` | Tremor, flutter | Laryngeal instability |
+| `REPETITION` | Stuttering, echolalia | Repetitive speech disorders |
 
 ```python
 config = ClinicalSpeechSSLConfig(
     use_augmentation_prediction=True,
-    num_augmentation_types=4,
-    predict_magnitude=True,  # Regress magnitude, not just presence
-    augmentation_per_region=True,  # Per-phoneme predictions
+    num_augmentation_types=5,
+    predict_magnitude=True,  # Regress magnitude (e.g., repeat count, semitones)
+    augmentation_per_region=True,  # Per-region predictions
 )
 ```
 
@@ -232,6 +344,17 @@ config = ClinicalSpeechSSLConfig(
     contrastive_projection_dim=256,
     contrastive_temperature=0.07,
 )
+```
+
+#### 4. GOP Prediction (optional, requires SoftAlign preprocessing)
+Predicts per-phoneme Goodness of Pronunciation scores (`soft_align.compute_gop` with `GOPMode.SOFT`) from the encoder. Targets are computed offline; the head soft-pools encoder features by gamma and applies an MLP per phoneme.
+
+```python
+config = ClinicalSpeechSSLConfig(
+    use_gop_prediction=True,
+    gop_loss_weight=0.5,
+)
+# Dataset must be configured with load_gop_targets=True
 ```
 
 ## Data Format
@@ -326,10 +449,12 @@ pytest tests/ --cov=clinical_speech_ssl --cov-report=html
 
 ```python
 # Available presets
-model = create_ssl_model("tiny")   # Minimal for testing
-model = create_ssl_model("small")  # Fast experimentation
-model = create_ssl_model("base")   # Recommended default
-model = create_ssl_model("large")  # Maximum performance
+model = create_ssl_model("tiny")          # Minimal for testing
+model = create_ssl_model("small")         # Fast experimentation
+model = create_ssl_model("base")          # Recommended (from-scratch CNN)
+model = create_ssl_model("large")         # Maximum capacity (from-scratch CNN)
+model = create_ssl_model("wavlm_base")    # Pretrained WavLM-base + conformer (recommended)
+model = create_ssl_model("wavlm_large")   # Pretrained WavLM-large + conformer (best results)
 ```
 
 ## Citation

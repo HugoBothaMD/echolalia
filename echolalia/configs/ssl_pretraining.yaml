@@ -14,7 +14,7 @@ model:
   use_contrastive: true
   
   # Augmentation Prediction Settings
-  num_augmentation_types: 4
+  num_augmentation_types: 5  # time_stretch, pitch_shift, formant_shift, amplitude_mod, repetition
   augmentation_per_region: true
   predict_magnitude: true
   
